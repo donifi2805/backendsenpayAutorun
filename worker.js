@@ -21,7 +21,7 @@ const ICS_BASE_URL = "https://api.ics-store.my.id/api/reseller";
 const KHFY_KEY = process.env.KHFY_KEY || "8F1199C1-483A-4C96-825E-F5EBD33AC60A"; 
 const ICS_KEY = process.env.ICS_KEY || "7274410f84b7e2810795810e879a4e0be8779c451d55e90e29d9bc174547ff77"; 
 
-const TG_TOKEN = "8515059248:AAGCbH_VlXUDsWn7ZVSIsFLEL7qdi6Zw7k";
+const TG_TOKEN = "8515059248:AAGCbH_VlXUDsWn7ZVSIsFLEfL7qdi6Zw7k";
 const TG_CHAT_ID = "7851913065";
 
 const KHFY_SPECIAL_CODES = ['XLA14', 'XLA32', 'XLA39', 'XLA51', 'XLA65', 'XLA89'];
@@ -54,6 +54,7 @@ async function sendTelegramLog(message, isUrgent = false) {
     } catch (e) { }
 }
 
+// --- FETCH STOCK FUNCTIONS ---
 async function getKHFYFullStock() {
     try {
         const response = await fetch(`${KHFY_BASE_URL}/list_product?api_key=${KHFY_KEY}`);
@@ -102,6 +103,7 @@ async function getKHFYAkrabSlots() {
     } catch (error) { return null; }
 }
 
+// --- LOGIKA TAMPILAN 2 KOLOM ---
 const formatCompact = (item, source) => {
     let statusStr = ""; let icon = "⚪";
     if (source === 'ICS') {
@@ -155,26 +157,28 @@ async function runPreorderQueue() {
     console.log(`[${new Date().toISOString()}] MEMULAI WORKER...`);
     
     try {
-        // Robot hanya mengambil antrian dengan status PENDING
         const snapshot = await db.collection('po_akrab').where('status', '==', 'PENDING').orderBy('timestamp', 'asc').limit(50).get();
 
+        // 1. Ambil Data Stok Masal
         const [khfyData, icsData, akrabSlotMap] = await Promise.all([ getKHFYFullStock(), getICSFullStock(), getKHFYAkrabSlots() ]);
-        const stockMapKHFY = khfyData?.map; 
-        const stockMapICS = icsData?.map;
-
+        
+        // 2. Build Laporan Stok Telegram
         let reportMsg = `🤖 <b>AUTORUN SENPAYMENT</b> [${getWIBTime()}]\n================================\n`;
+        
         reportMsg += "📊 <b>SLOT AKRAB V3</b>\n";
         if (akrabSlotMap) {
             KHFY_SPECIAL_CODES.forEach(code => {
                 const slot = akrabSlotMap[code] ?? 0;
                 reportMsg += `${slot > 3 ? '🟢' : '🔴'} ${PRODUCT_NAMES[code] || code}: <b>${slot}</b>\n`;
             });
-        }
+        } else { reportMsg += "⚠️ Gagal ambil slot V3\n"; }
+
         reportMsg += "\n📡 <b>SERVER ICS</b>\n";
         if (icsData?.list?.length > 0) {
             const cleanIcs = icsData.list.filter(i => i.code && !i.code.toLowerCase().includes('tes')).sort((a,b) => a.code.localeCompare(b.code));
             reportMsg += makeTwoColumns(cleanIcs, 'ICS');
         }
+
         reportMsg += "\n📡 <b>SERVER KHFY</b>\n";
         if (khfyData?.list) {
             const khfyItems = khfyData.list.filter(i => !KHFY_SPECIAL_CODES.includes(i.kode_produk)).sort((a,b) => a.kode_produk.localeCompare(b.kode_produk));
@@ -185,6 +189,7 @@ async function runPreorderQueue() {
 
         if (snapshot.empty) { console.log("ℹ️ Antrian kosong."); return; }
 
+        // 3. Proses Antrean
         for (const docSnap of snapshot.docs) {
             const po = docSnap.data();
             const poID = docSnap.id;
@@ -196,7 +201,7 @@ async function runPreorderQueue() {
 
             let isSkip = false; let skipReason = '';
 
-            // Proteksi Stok
+            // Cek Stok Sebelum Tembak API
             if (serverType === 'KHFY' && KHFY_SPECIAL_CODES.includes(skuProduk)) {
                 if ((akrabSlotMap?.[skuProduk] ?? 0) <= 3) { isSkip = true; skipReason = 'Slot Habis'; }
             } else if (serverType === 'KHFY' && khfyData?.map?.[skuProduk]) {
@@ -212,32 +217,23 @@ async function runPreorderQueue() {
 
             let result = await hitProviderDirect(serverType, { sku: skuProduk, tujuan, reffId });
             
-            // --- LOGIKA PENYEDERHANAAN STATUS ---
-            let finalStatus = 'PENDING'; // Default kembali ke PENDING jika tidak sukses
+            // Logika Update DB (Status: BERHASIL, PROSES, atau GAGAL)
+            let finalStatus = 'PENDING'; 
             const strRes = JSON.stringify(result).toLowerCase();
-            
-            // Hanya ganti ke BERHASIL jika respon jelas-jelas sukses
-            if (strRes.includes('sukses') || strRes.includes('berhasil')) {
-                finalStatus = 'BERHASIL';
-            }
+            if (strRes.includes('sukses') || strRes.includes('berhasil')) finalStatus = 'BERHASIL';
+            else if (strRes.includes('pending') || strRes.includes('proses')) finalStatus = 'PROSES';
+            else finalStatus = 'GAGAL';
 
-            // Update Database (Hanya PENDING atau BERHASIL)
             await db.collection('po_akrab').doc(poID).update({ 
-                status: finalStatus, 
-                pesan_api: result.message || 'Updated', 
-                sn: result.data?.sn || result.sn || '-', 
-                raw_json: JSON.stringify(result) 
+                status: finalStatus, pesan_api: result.message || 'Updated', 
+                sn: result.data?.sn || result.sn || '-', raw_json: JSON.stringify(result) 
             });
 
             // Update Riwayat User
             const rSnap = await db.collection('users').doc(po.uid).collection('riwayat_transaksi').where('trx_id', '==', reffId).get();
-            rSnap.forEach(async (d) => { 
-                await d.ref.update({ status: finalStatus, sn: result.data?.sn || '-' }); 
-            });
+            rSnap.forEach(async (d) => { await d.ref.update({ status: finalStatus, sn: result.data?.sn || '-' }); });
 
-            await sendTelegramLog(`<b>TRX LOG:</b>\n👤 ${buyerName}\n📦 ${skuProduk}\n📱 ${tujuan}\n🏁 Status: <b>${finalStatus}</b>`);
-            
-            // Jeda antar transaksi agar tidak terkena limit API provider
+            await sendTelegramLog(`<b>TRX LOG:</b>\n👤 ${buyerName}\n📦 ${skuProduk}\n📱 ${tujuan}\n🏁 Status: ${finalStatus}`);
             await new Promise(r => setTimeout(r, 5000));
         }
     } catch (error) { 
